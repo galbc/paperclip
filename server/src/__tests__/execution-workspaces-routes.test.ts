@@ -97,7 +97,14 @@ describe.sequential("execution workspace routes", () => {
       reason: "allow_test",
       explanation: "Allowed by test mock.",
     });
-    mockExecutionWorkspaceService.list.mockResolvedValue([]);
+    mockExecutionWorkspaceService.list.mockResolvedValue({
+      items: [],
+      total: 0,
+      limit: 500,
+      offset: 0,
+      hasMore: false,
+      nextOffset: null,
+    });
     mockExecutionWorkspaceService.listOverview.mockResolvedValue({
       items: [],
       total: 0,
@@ -106,14 +113,21 @@ describe.sequential("execution workspace routes", () => {
       hasMore: false,
       nextOffset: null,
     });
-    mockExecutionWorkspaceService.listSummaries.mockResolvedValue([
-      {
-        id: "workspace-1",
-        name: "Alpha",
-        mode: "isolated_workspace",
-        projectWorkspaceId: null,
-      },
-    ]);
+    mockExecutionWorkspaceService.listSummaries.mockResolvedValue({
+      items: [
+        {
+          id: "workspace-1",
+          name: "Alpha",
+          mode: "isolated_workspace",
+          projectWorkspaceId: null,
+        },
+      ],
+      total: 1,
+      limit: 500,
+      offset: 0,
+      hasMore: false,
+      nextOffset: null,
+    });
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
     mockExecutionWorkspaceService.reconcileExecutionWorkspaceBranch.mockResolvedValue(null);
     mockHeartbeatService.wakeup.mockResolvedValue(null);
@@ -138,7 +152,71 @@ describe.sequential("execution workspace routes", () => {
       issueId: undefined,
       status: undefined,
       reuseEligible: true,
+      limit: undefined,
+      offset: undefined,
     });
+    expect(mockExecutionWorkspaceService.list).not.toHaveBeenCalled();
+  });
+
+  it("reports the served window in headers while the body stays an array", async () => {
+    mockExecutionWorkspaceService.list.mockResolvedValue({
+      items: [{ id: "workspace-1" }],
+      total: 1988,
+      limit: 500,
+      offset: 0,
+      hasMore: true,
+      nextOffset: 500,
+    });
+
+    const res = await request(createApp())
+      .get("/api/companies/company-1/execution-workspaces");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ id: "workspace-1" }]);
+    expect(res.headers["x-total-count"]).toBe("1988");
+    expect(res.headers["x-page-limit"]).toBe("500");
+    expect(res.headers["x-has-more"]).toBe("true");
+    expect(res.headers["x-next-offset"]).toBe("500");
+  });
+
+  it("returns the pagination envelope when the caller opts in", async () => {
+    mockExecutionWorkspaceService.list.mockResolvedValue({
+      items: [{ id: "workspace-2" }],
+      total: 3,
+      limit: 1,
+      offset: 1,
+      hasMore: true,
+      nextOffset: 2,
+    });
+
+    const res = await request(createApp())
+      .get("/api/companies/company-1/execution-workspaces?paginated=true&limit=1&offset=1");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      items: [{ id: "workspace-2" }],
+      total: 3,
+      limit: 1,
+      offset: 1,
+      hasMore: true,
+      nextOffset: 2,
+    });
+    expect(mockExecutionWorkspaceService.list).toHaveBeenCalledWith("company-1", {
+      projectId: undefined,
+      projectWorkspaceId: undefined,
+      issueId: undefined,
+      status: undefined,
+      reuseEligible: false,
+      limit: 1,
+      offset: 1,
+    });
+  });
+
+  it("rejects a page window the endpoint cannot serve", async () => {
+    const res = await request(createApp())
+      .get("/api/companies/company-1/execution-workspaces?limit=100000");
+
+    expect(res.status).toBe(422);
     expect(mockExecutionWorkspaceService.list).not.toHaveBeenCalled();
   });
 

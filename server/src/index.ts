@@ -1348,6 +1348,23 @@ async function startServerWithDatabaseTeardown(
         }));
     };
 
+    // Rows whose worktree path vanished can never satisfy the terminal reaper's
+    // delivery proof, so they stay non-terminal forever and the inventory only
+    // grows. This sweep archives them on their own cadence.
+    const scheduleMissingWorkspacePathSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(terminalWorkspaces
+        .sweepMissingWorkspacePaths()
+        .then((result) => {
+          if (result.archived > 0) {
+            logger.info(result, "missing-path workspace reaper archived workspaces");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "missing-path workspace reaper failed");
+        }));
+    };
+
     // The restart-safe cleanup backstop for adapter login sessions. The
     // in-process five-minute timer stays the primary control. This reaper runs
     // on startup and on the scheduler interval. It deletes the login sandbox for
@@ -1654,6 +1671,7 @@ async function startServerWithDatabaseTeardown(
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();
+        scheduleMissingWorkspacePathSweep();
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();

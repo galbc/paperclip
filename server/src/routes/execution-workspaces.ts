@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
+import { z } from "zod";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
@@ -31,7 +32,11 @@ import {
   LEASED_WORKSPACE_RUNTIME_ACTIONS,
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
-import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
+import {
+  MAX_EXECUTION_WORKSPACE_LIST_LIMIT,
+  mergeExecutionWorkspaceConfig,
+  readExecutionWorkspaceConfig,
+} from "../services/execution-workspaces.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -63,6 +68,14 @@ import {
 import { conflict, unprocessable } from "../errors.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
+
+// The execution workspace list is bounded. Without a window a company with a
+// large workspace inventory serves a response big enough for the client to time
+// out before the first byte. `limit` and `offset` page through the rest.
+const executionWorkspaceListPageQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(MAX_EXECUTION_WORKSPACE_LIST_LIMIT).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+});
 
 function isReadableFile(filePath: string) {
   try {
@@ -122,17 +135,35 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, companyId))) return;
+    const parsedPage = executionWorkspaceListPageQuerySchema.safeParse(req.query);
+    if (!parsedPage.success) {
+      res.status(422).json({
+        error: "Invalid execution workspace list query",
+        details: parsedPage.error.flatten(),
+      });
+      return;
+    }
     const filters = {
       projectId: req.query.projectId as string | undefined,
       projectWorkspaceId: req.query.projectWorkspaceId as string | undefined,
       issueId: req.query.issueId as string | undefined,
       status: req.query.status as string | undefined,
       reuseEligible: req.query.reuseEligible === "true",
+      limit: parsedPage.data.limit,
+      offset: parsedPage.data.offset,
     };
-    const workspaces = req.query.summary === "true"
+    const page = req.query.summary === "true"
       ? await svc.listSummaries(companyId, filters)
       : await svc.list(companyId, filters);
-    res.json(workspaces);
+    // The body stays an array so existing clients keep working. A bounded page
+    // can now be shorter than the full inventory, so the window is reported in
+    // headers and a caller that opts in with `paginated=true` gets the envelope.
+    res.setHeader("X-Total-Count", String(page.total));
+    res.setHeader("X-Page-Limit", String(page.limit));
+    res.setHeader("X-Page-Offset", String(page.offset));
+    res.setHeader("X-Has-More", page.hasMore ? "true" : "false");
+    if (page.nextOffset !== null) res.setHeader("X-Next-Offset", String(page.nextOffset));
+    res.json(req.query.paginated === "true" ? page : page.items);
   });
 
   router.get("/companies/:companyId/workspace-overview", async (req, res) => {

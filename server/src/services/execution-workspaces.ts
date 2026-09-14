@@ -91,6 +91,73 @@ const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
 
+// The reason recorded when the reaper archives a workspace whose worktree path
+// no longer resolves on this host.
+export const MISSING_WORKSPACE_PATH_CLEANUP_REASON = "workspace_path_missing";
+
+// How long the missing-path reaper waits after a row's last update before it
+// treats a vanished worktree path as permanent. A row is written before its
+// worktree exists on disk, so an immediate check would archive a workspace that
+// is still being created.
+export const MISSING_WORKSPACE_PATH_GRACE_MS = 60 * 60 * 1000;
+
+// Collection reads are bounded. An unbounded list over a large inventory holds
+// the request open long enough for the client to time out, and the caller has no
+// way to ask for the rest. Callers that need more pass limit/offset.
+export const DEFAULT_EXECUTION_WORKSPACE_LIST_LIMIT = 500;
+export const MAX_EXECUTION_WORKSPACE_LIST_LIMIT = 1000;
+
+export type ExecutionWorkspaceListFilters = {
+  projectId?: string;
+  projectWorkspaceId?: string;
+  issueId?: string;
+  status?: string;
+  reuseEligible?: boolean;
+  limit?: number;
+  offset?: number;
+};
+
+export type ExecutionWorkspaceListPage<T> = {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+};
+
+// Clamp the requested window into a range the endpoint can always serve. An
+// out-of-range or absent limit falls back to the default rather than erroring,
+// so the service stays bounded even when a caller skips validation.
+function resolveExecutionWorkspaceListBounds(filters?: { limit?: number; offset?: number }) {
+  const requestedLimit = filters?.limit;
+  const limit = typeof requestedLimit === "number" && Number.isFinite(requestedLimit)
+    ? Math.min(Math.max(Math.trunc(requestedLimit), 1), MAX_EXECUTION_WORKSPACE_LIST_LIMIT)
+    : DEFAULT_EXECUTION_WORKSPACE_LIST_LIMIT;
+  const requestedOffset = filters?.offset;
+  const offset = typeof requestedOffset === "number" && Number.isFinite(requestedOffset)
+    ? Math.max(Math.trunc(requestedOffset), 0)
+    : 0;
+  return { limit, offset };
+}
+
+function buildExecutionWorkspaceListPage<T>(
+  items: T[],
+  total: number,
+  limit: number,
+  offset: number,
+): ExecutionWorkspaceListPage<T> {
+  const nextOffset = offset + items.length;
+  return {
+    items,
+    total,
+    limit,
+    offset,
+    hasMore: nextOffset < total,
+    nextOffset: nextOffset < total ? nextOffset : null,
+  };
+}
+
 // The reopen-failure reason kept on the row when a rebuild does not finish. The
 // value is sanitized: it never contains a repository URL, a host path, or git
 // output.
@@ -1318,6 +1385,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
 
+  // The missing-path reaper scans the same non-terminal rows as the terminal
+  // reaper, so it needs its own cursor: most candidates are healthy and get
+  // skipped, and without a cursor every sweep would re-read the same oldest
+  // healthy rows and never reach the stale tail. The cursor resets when a sweep
+  // reaches a short page. The grace cutoff below already excludes recently
+  // updated rows, so this scan does not need the frozen upper bound the terminal
+  // reaper uses.
+  let missingPathSweepCursor: { updatedAt: Date; id: string } | null = null;
+  let missingPathSweepInProgress = false;
+
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
     return db
@@ -1823,13 +1900,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
   function buildListConditions(
     companyId: string,
-    filters?: {
-      projectId?: string;
-      projectWorkspaceId?: string;
-      issueId?: string;
-      status?: string;
-      reuseEligible?: boolean;
-    },
+    filters?: ExecutionWorkspaceListFilters,
   ) {
     const conditions = [eq(executionWorkspaces.companyId, companyId)];
     if (filters?.projectId) conditions.push(eq(executionWorkspaces.projectId, filters.projectId));
@@ -2072,55 +2143,82 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
     },
 
-    list: async (companyId: string, filters?: {
-      projectId?: string;
-      projectWorkspaceId?: string;
-      issueId?: string;
-      status?: string;
-      reuseEligible?: boolean;
-    }) => {
-      const conditions = buildListConditions(companyId, filters);
-      const rows = await db
-        .select()
-        .from(executionWorkspaces)
-        .where(and(...conditions))
-        .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.createdAt));
+    list: async (
+      companyId: string,
+      filters?: ExecutionWorkspaceListFilters,
+    ): Promise<ExecutionWorkspaceListPage<ExecutionWorkspace>> => {
+      const whereClause = and(...buildListConditions(companyId, filters));
+      const { limit, offset } = resolveExecutionWorkspaceListBounds(filters);
+      const [totalRow, rows] = await Promise.all([
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(executionWorkspaces)
+          .where(whereClause)
+          .then((result) => result[0] ?? { count: 0 }),
+        db
+          .select()
+          .from(executionWorkspaces)
+          .where(whereClause)
+          // The id tiebreaker keeps the order total. Rows that share a
+          // lastUsedAt and a createdAt would otherwise be free to swap between
+          // pages, so a paging caller could see one row twice and miss another.
+          .orderBy(
+            desc(executionWorkspaces.lastUsedAt),
+            desc(executionWorkspaces.createdAt),
+            asc(executionWorkspaces.id),
+          )
+          .limit(limit)
+          .offset(offset),
+      ]);
       const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, companyId, rows);
       // Collection reads are deliberately DB-only. Delivery-state hydration
       // inspects git and may resolve pull requests, so doing it for every row
       // lets a large inventory launch an unbounded number of child processes.
       // Detail and close-readiness reads retain the live hydration path.
-      return rows.map((row) =>
+      const items = rows.map((row) =>
         toExecutionWorkspace(
           row,
           (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
         ),
       );
+      return buildExecutionWorkspaceListPage(items, totalRow.count, limit, offset);
     },
 
-    listSummaries: async (companyId: string, filters?: {
-      projectId?: string;
-      projectWorkspaceId?: string;
-      issueId?: string;
-      status?: string;
-      reuseEligible?: boolean;
-    }) => {
-      const conditions = buildListConditions(companyId, filters);
-      const rows = await db
-        .select({
-          id: executionWorkspaces.id,
-          name: executionWorkspaces.name,
-          mode: executionWorkspaces.mode,
-          status: executionWorkspaces.status,
-          cwd: executionWorkspaces.cwd,
-          branchName: executionWorkspaces.branchName,
-          projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
-          lastUsedAt: executionWorkspaces.lastUsedAt,
-        })
-        .from(executionWorkspaces)
-        .where(and(...conditions))
-        .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.createdAt));
-      return rows.map((row) => toExecutionWorkspaceSummary(row));
+    listSummaries: async (
+      companyId: string,
+      filters?: ExecutionWorkspaceListFilters,
+    ): Promise<ExecutionWorkspaceListPage<ExecutionWorkspaceSummary>> => {
+      const whereClause = and(...buildListConditions(companyId, filters));
+      const { limit, offset } = resolveExecutionWorkspaceListBounds(filters);
+      const [totalRow, rows] = await Promise.all([
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(executionWorkspaces)
+          .where(whereClause)
+          .then((result) => result[0] ?? { count: 0 }),
+        db
+          .select({
+            id: executionWorkspaces.id,
+            name: executionWorkspaces.name,
+            mode: executionWorkspaces.mode,
+            status: executionWorkspaces.status,
+            cwd: executionWorkspaces.cwd,
+            branchName: executionWorkspaces.branchName,
+            projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+            lastUsedAt: executionWorkspaces.lastUsedAt,
+          })
+          .from(executionWorkspaces)
+          .where(whereClause)
+          .orderBy(
+            desc(executionWorkspaces.lastUsedAt),
+            desc(executionWorkspaces.createdAt),
+            asc(executionWorkspaces.id),
+          )
+          .limit(limit)
+          .offset(offset),
+      ]);
+      const items = rows.map((row) => toExecutionWorkspaceSummary(row));
+      return buildExecutionWorkspaceListPage(items, totalRow.count, limit, offset);
     },
 
     findGitWorktreeContention: async (input: {
@@ -2877,6 +2975,149 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return result;
       } finally {
         terminalSweepInProgress = false;
+      }
+    },
+
+    // Archive rows whose worktree path no longer resolves on this host. The
+    // terminal reaper cannot reclaim these. It only archives a workspace it can
+    // prove delivered, and it proves delivery by inspecting the worktree, which
+    // is gone: `inspectGitCloseReadiness` returns a null `repoRoot`, delivery
+    // resolves to undelivered, and the row is skipped forever. So every deleted
+    // worktree leaves an `active` row behind, the inventory grows without bound,
+    // and each rotation pays to re-inspect rows that can never become eligible.
+    //
+    // This reaper does not touch the filesystem beyond the existence check.
+    // There is nothing left to delete; a stale `git worktree` registration in
+    // the parent repository is reclaimed by `git worktree prune`.
+    sweepMissingWorkspacePaths: async (limit = 50) => {
+      // A second concurrent sweep would share the cursor with the first and
+      // could leave it pointing at a row neither sweep finished. Skipping is
+      // safe: the next tick runs with intact state.
+      if (missingPathSweepInProgress) {
+        return {
+          checked: 0,
+          archived: 0,
+          skippedPathPresent: 0,
+          skippedNoPath: 0,
+          skippedActiveRun: 0,
+          skippedReopenPending: 0,
+          skippedRace: 0,
+        };
+      }
+      missingPathSweepInProgress = true;
+      try {
+        const cursor = missingPathSweepCursor;
+        // A row is written before its worktree is materialized on disk, so a
+        // workspace that is still being created looks identical to one whose
+        // directory was deleted. The grace cutoff keeps the reaper off any row
+        // touched recently enough to still be mid-creation.
+        const graceCutoff = new Date(now().getTime() - MISSING_WORKSPACE_PATH_GRACE_MS);
+        const candidates = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(and(
+            inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+            isNull(executionWorkspaces.closedAt),
+            // Only a local worktree has a path this host can judge. A workspace
+            // backed by a sandbox or a remote provider can be absent here and
+            // perfectly alive there, so a missing path proves nothing about it.
+            eq(executionWorkspaces.providerType, "git_worktree"),
+            lte(executionWorkspaces.updatedAt, graceCutoff),
+            cursor
+              ? or(
+                  gt(executionWorkspaces.updatedAt, cursor.updatedAt),
+                  and(
+                    eq(executionWorkspaces.updatedAt, cursor.updatedAt),
+                    gt(executionWorkspaces.id, cursor.id),
+                  ),
+                )
+              : undefined,
+          ))
+          .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+          .limit(limit);
+        if (candidates.length < limit) missingPathSweepCursor = null;
+        else {
+          const lastCandidate = candidates[candidates.length - 1]!;
+          missingPathSweepCursor = { updatedAt: lastCandidate.updatedAt, id: lastCandidate.id };
+        }
+
+        const result = {
+          checked: candidates.length,
+          archived: 0,
+          skippedPathPresent: 0,
+          skippedNoPath: 0,
+          skippedActiveRun: 0,
+          skippedReopenPending: 0,
+          skippedRace: 0,
+        };
+
+        for (const workspace of candidates) {
+          const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+          if (!workspacePath) {
+            result.skippedNoPath += 1;
+            continue;
+          }
+          if (await pathExists(workspacePath)) {
+            result.skippedPathPresent += 1;
+            continue;
+          }
+          if (metadataHasReopenPendingConsumption(workspace.metadata as Record<string, unknown> | null)) {
+            result.skippedReopenPending += 1;
+            continue;
+          }
+          // A reopen rebuilds the worktree from the row, so a live run can be
+          // holding a workspace whose directory has not been recreated yet.
+          if (await workspaceHasActiveRun(workspace)) {
+            result.skippedActiveRun += 1;
+            continue;
+          }
+
+          const closedAt = now();
+          // Raise the lifecycle generation so a reopen that races this archive
+          // is distinguishable from the state this sweep observed.
+          const archivedMetadata = bumpExecutionWorkspaceLifecycleGeneration(
+            workspace.metadata as Record<string, unknown> | null,
+          );
+          const archived = await db.transaction(async (tx) => {
+            await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+            return tx
+              .update(executionWorkspaces)
+              .set({
+                status: "archived",
+                closedAt,
+                cleanupEligibleAt: workspace.cleanupEligibleAt ?? closedAt,
+                cleanupReason: MISSING_WORKSPACE_PATH_CLEANUP_REASON,
+                metadata: archivedMetadata,
+                updatedAt: closedAt,
+              })
+              .where(and(
+                eq(executionWorkspaces.id, workspace.id),
+                eq(executionWorkspaces.companyId, workspace.companyId),
+                inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+                isNull(executionWorkspaces.closedAt),
+                sql<boolean>`(${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY}) IS DISTINCT FROM 'true'`,
+              ))
+              .returning()
+              .then((rows) => rows[0] ?? null);
+          });
+          if (!archived) {
+            result.skippedRace += 1;
+            continue;
+          }
+          result.archived += 1;
+          await logActivity(db, {
+            companyId: archived.companyId,
+            actorType: "system",
+            actorId: "workspace_missing_path_reaper",
+            action: "execution_workspace.missing_path_archived",
+            entityType: "execution_workspace",
+            entityId: archived.id,
+            details: { sourceIssueId: archived.sourceIssueId, branchName: archived.branchName },
+          });
+        }
+        return result;
+      } finally {
+        missingPathSweepInProgress = false;
       }
     },
 

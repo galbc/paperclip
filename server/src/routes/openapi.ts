@@ -7653,9 +7653,27 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/execution-workspaces",
   tags: ["execution-workspaces"],
-  summary: "List execution workspaces for a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "List execution workspaces for a company (bounded page)",
+  description:
+    "Returns a bounded page of execution workspaces, newest use first. The body is an array of "
+    + "workspaces, or of summaries when `summary=true`. The window is reported in the X-Total-Count, "
+    + "X-Page-Limit, X-Page-Offset, X-Has-More and X-Next-Offset response headers; pass "
+    + "`paginated=true` to receive the same fields as a JSON envelope instead.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      projectId: z.string().optional(),
+      projectWorkspaceId: z.string().optional(),
+      issueId: z.string().optional(),
+      status: z.string().optional(),
+      reuseEligible: z.enum(["true", "false"]).optional(),
+      summary: z.enum(["true", "false"]).optional(),
+      paginated: z.enum(["true", "false"]).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+      offset: z.coerce.number().int().min(0).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 422: r.unprocessable },
 });
 
 registry.registerPath({

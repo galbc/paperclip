@@ -28,6 +28,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  DEFAULT_EXECUTION_WORKSPACE_LIST_LIMIT,
+  MAX_EXECUTION_WORKSPACE_LIST_LIMIT,
+  MISSING_WORKSPACE_PATH_CLEANUP_REASON,
+  MISSING_WORKSPACE_PATH_GRACE_MS,
   EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
@@ -552,6 +556,97 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
     expect(workspace).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
+  }, 20_000);
+
+  it("archives a workspace the terminal reaper can never reclaim because its worktree is gone", async () => {
+    const staleUpdatedAt = new Date(Date.now() - MISSING_WORKSPACE_PATH_GRACE_MS - 60_000);
+    const seeded = await seedAncestryTerminalWorkspace({ updatedAt: staleUpdatedAt });
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+    // The terminal reaper proves delivery from the worktree. With the worktree
+    // gone there is nothing left to prove it with, so this row would stay
+    // non-terminal forever.
+    const terminalSweep = await svc.sweepTerminalWorkspaces();
+    expect(terminalSweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+
+    const sweep = await svc.sweepMissingWorkspacePaths();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(sweep).toMatchObject({ archived: 1, skippedPathPresent: 0 });
+    expect(workspace).toMatchObject({
+      status: "archived",
+      cleanupReason: MISSING_WORKSPACE_PATH_CLEANUP_REASON,
+    });
+  }, 20_000);
+
+  it("leaves a workspace alone while its worktree is still on disk", async () => {
+    const staleUpdatedAt = new Date(Date.now() - MISSING_WORKSPACE_PATH_GRACE_MS - 60_000);
+    const seeded = await seedAncestryTerminalWorkspace({ updatedAt: staleUpdatedAt });
+
+    const sweep = await svc.sweepMissingWorkspacePaths();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(sweep).toMatchObject({ archived: 0, skippedPathPresent: 1 });
+    expect(workspace).toMatchObject({ status: "active" });
+  }, 20_000);
+
+  it("does not reap a freshly written row whose worktree is not materialized yet", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+    const sweep = await svc.sweepMissingWorkspacePaths();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(sweep).toMatchObject({ checked: 0, archived: 0 });
+    expect(workspace).toMatchObject({ status: "active" });
+  }, 20_000);
+
+  it("keeps a missing-path workspace that a live run still owns", async () => {
+    const staleUpdatedAt = new Date(Date.now() - MISSING_WORKSPACE_PATH_GRACE_MS - 60_000);
+    const seeded = await seedAncestryTerminalWorkspace({ updatedAt: staleUpdatedAt });
+    await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId: seeded.companyId,
+      name: "Engineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId,
+      status: "running",
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: runId })
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    const sweep = await svc.sweepMissingWorkspacePaths();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(sweep).toMatchObject({ archived: 0, skippedActiveRun: 1 });
+    expect(workspace).toMatchObject({ status: "active" });
   }, 20_000);
 
   it("fails closed before archive when git status inspection is unavailable", async () => {
@@ -2098,7 +2193,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       reuseEligible: true,
     });
 
-    expect(summaries).toEqual([
+    expect(summaries.items).toEqual([
       expect.objectContaining({
         id: openWorkspaceId,
         name: "Open isolated workspace",
@@ -3947,14 +4042,34 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       db.execute(sql`select 1 as ok`).then(() => true),
       new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
     ]);
-    const workspaces = await inventoryPromise;
+    const page = await inventoryPromise;
+    const workspaces = page.items;
 
     expect(healthResponsive).toBe(true);
     expect(inspectGitCloseReadiness).not.toHaveBeenCalled();
-    expect(workspaces).toHaveLength(workspaceCount);
+    // The collection read is bounded: it reports the whole inventory but serves
+    // one page of it, so a company with thousands of rows cannot make the
+    // endpoint hang.
+    expect(page.total).toBe(workspaceCount);
+    expect(workspaces).toHaveLength(DEFAULT_EXECUTION_WORKSPACE_LIST_LIMIT);
+    expect(page.hasMore).toBe(true);
+    expect(page.nextOffset).toBe(DEFAULT_EXECUTION_WORKSPACE_LIST_LIMIT);
     expect(workspaces.every((workspace) => workspace.deliveryState === "unknown")).toBe(true);
     expect(workspaces.reduce((count, workspace) => count + (workspace.runtimeServices?.length ?? 0), 0)).toBe(0);
     expect(JSON.stringify(workspaces).length).toBeLessThan(12_000_000);
+
+    // Paging walks the rest of the inventory without repeating or skipping a row.
+    const secondPage = await inventoryService.list(companyId, {
+      limit: DEFAULT_EXECUTION_WORKSPACE_LIST_LIMIT,
+      offset: page.nextOffset!,
+    });
+    expect(secondPage.offset).toBe(DEFAULT_EXECUTION_WORKSPACE_LIST_LIMIT);
+    const firstPageIds = new Set(workspaces.map((workspace) => workspace.id));
+    expect(secondPage.items.some((workspace) => firstPageIds.has(workspace.id))).toBe(false);
+
+    // An oversized request is clamped rather than served unbounded.
+    const clamped = await inventoryService.list(companyId, { limit: workspaceCount });
+    expect(clamped.items).toHaveLength(MAX_EXECUTION_WORKSPACE_LIST_LIMIT);
 
     const overview = await svc.listOverview(companyId, { limit: 1, offset: 0 });
     expect(overview.total).toBe(workspaceCount);
@@ -4094,7 +4209,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       },
     ]);
 
-    const [workspace] = await svc.list(companyId);
+    const [workspace] = (await svc.list(companyId)).items;
     expect(workspace?.runtimeServices).toEqual([
       expect.objectContaining({
         id: currentWebServiceId,
@@ -4261,7 +4376,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       },
     ]);
 
-    const workspaces = await svc.list(companyId);
+    const workspaces = (await svc.list(companyId)).items;
     const readyService = workspaces
       .find((workspace) => workspace.id === readyWorkspaceId)
       ?.runtimeServices.find((service) => service.id === readyServiceId);
