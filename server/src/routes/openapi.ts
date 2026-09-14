@@ -103,6 +103,7 @@ import {
   reconcileExecutionWorkspaceBranchSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
+  executionWorkspaceAuditQuerySchema,
   workspaceRuntimeControlTargetSchema,
   // Environments
   createEnvironmentSchema,
@@ -5255,6 +5256,18 @@ registry.registerPath({
   request: {
     params: z.object({ companyId: z.string() }),
     query: workspaceOverviewQuerySchema,
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/execution-workspaces/audit",
+  tags: ["execution-workspaces"],
+  summary: "List bounded raw execution workspace audit records without live delivery computation",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: executionWorkspaceAuditQuerySchema,
   },
   responses: { 200: r.ok(), 401: r.unauthorized, 422: r.unprocessable },
 });

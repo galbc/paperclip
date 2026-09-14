@@ -373,6 +373,8 @@ export type {
   ExecutionWorkspaceCloseAction,
   ExecutionWorkspaceCloseActionKind,
   ExecutionWorkspaceCloseGitReadiness,
+  ExecutionWorkspaceAuditItem,
+  ExecutionWorkspaceAuditResponse,
   ExecutionWorkspaceCloseLinkedIssue,
   ExecutionWorkspaceCloseReadiness,
   ExecutionWorkspaceCloseReadinessState,

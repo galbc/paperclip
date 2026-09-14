@@ -22,6 +22,8 @@ import type {
   ExecutionWorkspaceCloseAction,
   ExecutionWorkspaceCloseGitReadiness,
   ExecutionWorkspaceCloseReadiness,
+  ExecutionWorkspaceAuditResponse,
+  ExecutionWorkspaceAuditQuery,
   ExecutionWorkspaceConfig,
   WorkspaceOverviewResponse,
   WorkspaceOverviewItem,
@@ -208,6 +210,7 @@ export type ExecutionWorkspaceServiceOptions = {
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
   beforeTerminalWorkspaceCleanup?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
+  afterGitDeliveryInspection?: (workspace: ExecutionWorkspace) => Promise<void>;
 };
 
 function parseGitHubRepository(repoUrl: string | null) {
@@ -760,7 +763,10 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
-async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
+async function inspectGitCloseReadiness(
+  workspace: ExecutionWorkspace,
+  afterDeliveryInspection?: (workspace: ExecutionWorkspace) => Promise<void>,
+): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
   statusInspectionSucceeded: boolean;
@@ -789,6 +795,8 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
         workspacePath,
         branchName: workspace.branchName,
         baseRef: workspace.baseRef,
+        headSha: null,
+        identityVerified: false,
         hasDirtyTrackedFiles: false,
         hasUntrackedFiles: false,
         dirtyEntryCount: 0,
@@ -812,13 +820,35 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     );
   }
 
-  let branchName = workspace.branchName;
-  if (repoRoot && !branchName) {
+  let liveBranchName: string | null = null;
+  let headSha: string | null = null;
+  if (repoRoot) {
     try {
-      branchName = (await runGit(["rev-parse", "--abbrev-ref", "HEAD"], workspacePath)).stdout.trim() || null;
+      liveBranchName = (await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], workspacePath)).stdout.trim() || null;
+      headSha = (await runGit(["rev-parse", "HEAD"], workspacePath)).stdout.trim() || null;
     } catch {
-      branchName = workspace.branchName;
+      liveBranchName = null;
+      headSha = null;
     }
+  }
+  const recordedBranchName = readNullableString(workspace.branchName);
+  const exactWorktreeRequired = workspace.providerType === "git_worktree";
+  const [canonicalRepoRoot, canonicalWorkspacePath] = repoRoot
+    ? await Promise.all([
+      fs.realpath(repoRoot).catch(() => path.resolve(repoRoot!)),
+      fs.realpath(workspacePath).catch(() => path.resolve(workspacePath)),
+    ])
+    : [null, null];
+  const worktreeIdentityMatches = Boolean(
+    repoRoot && (!exactWorktreeRequired || canonicalRepoRoot === canonicalWorkspacePath),
+  );
+  const branchIdentityMatches = !recordedBranchName || liveBranchName === recordedBranchName;
+  let identityVerified = worktreeIdentityMatches && branchIdentityMatches && headSha !== null;
+  if (!worktreeIdentityMatches && repoRoot) {
+    warnings.push(`Git resolved workspace path "${workspacePath}" to a different worktree root; delivery evidence is unknown.`);
+  }
+  if (!branchIdentityMatches) {
+    warnings.push(`Live git branch does not match recorded branch "${recordedBranchName}"; delivery evidence is unknown.`);
   }
 
   let dirtyEntryCount = 0;
@@ -856,8 +886,15 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   let behindCount: number | null = null;
   let isMergedIntoBase: boolean | null = null;
   const baseRef = workspace.baseRef;
+  const allowsAncestryEvidence = !(
+    workspace.mode === "shared_workspace"
+    && (!recordedBranchName || recordedBranchName === baseRef)
+  );
+  if (identityVerified && baseRef && !allowsAncestryEvidence) {
+    warnings.push("Shared workspace HEAD alone cannot establish task delivery; pull request evidence is required.");
+  }
 
-  if (repoRoot && baseRef) {
+  if (repoRoot && baseRef && identityVerified && allowsAncestryEvidence) {
     try {
       const counts = (await runGit(["rev-list", "--left-right", "--count", `${baseRef}...HEAD`], workspacePath)).stdout.trim();
       const [behindRaw, aheadRaw] = counts.split(/\s+/);
@@ -883,12 +920,29 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     }
   }
 
+  if (identityVerified) {
+    await afterDeliveryInspection?.(workspace);
+    const finalHeadSha = await runGit(["rev-parse", "HEAD"], workspacePath)
+      .then((result) => result.stdout.trim() || null)
+      .catch(() => null);
+    if (!finalHeadSha || finalHeadSha !== headSha) {
+      identityVerified = false;
+      headSha = null;
+      aheadCount = null;
+      behindCount = null;
+      isMergedIntoBase = null;
+      warnings.push("Git HEAD changed during delivery inspection; delivery evidence is unknown.");
+    }
+  }
+
   return {
     git: {
       repoRoot,
       workspacePath,
-      branchName,
+      branchName: liveBranchName ?? recordedBranchName,
       baseRef,
+      headSha,
+      identityVerified,
       hasDirtyTrackedFiles: dirtyEntryCount > 0,
       hasUntrackedFiles: untrackedEntryCount > 0,
       dirtyEntryCount,
@@ -1325,11 +1379,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const subtreeTerminal = Boolean(sourceIssue && issueTree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
     let mergedPullRequest = false;
     let pullRequestStateUnknown = false;
-    const workspaceHeadSha = git?.repoRoot && git.workspacePath
-      ? await runGit(["rev-parse", "HEAD"], git.workspacePath)
-        .then((result) => result.stdout.trim() || null)
-        .catch(() => null)
-      : null;
+    const workspaceHeadSha = git?.identityVerified ? git.headSha : null;
 
     if (sourceIssueTerminal) {
       const products = await listDeliveryPullRequestProducts(workspace);
@@ -1402,7 +1452,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
 
     const [current, currentHeadSha, currentBranchName] = await Promise.all([
-      inspectGitCloseReadiness(toExecutionWorkspace(workspace)),
+      inspectGitCloseReadiness(toExecutionWorkspace(workspace), opts.afterGitDeliveryInspection),
       readGitStdout(["rev-parse", "HEAD"], workspacePath).catch(() => null),
       readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], workspacePath).catch(() => null),
     ]);
@@ -1422,7 +1472,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
   async function hydrateWorkspace(row: ExecutionWorkspaceRow, runtimeServices: WorkspaceRuntimeService[] = []) {
     const workspace = toExecutionWorkspace(row, runtimeServices);
-    const { git } = await inspectGitCloseReadiness(workspace);
+    const { git } = await inspectGitCloseReadiness(workspace, opts.afterGitDeliveryInspection);
     const assessment = await assessDelivery(row, git);
     return toExecutionWorkspace(row, runtimeServices, assessment.deliveryState);
   }
@@ -1792,6 +1842,53 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   }
 
   return {
+    listAudit: async (
+      companyId: string,
+      filters: ExecutionWorkspaceAuditQuery,
+    ): Promise<ExecutionWorkspaceAuditResponse> => {
+      const whereClause = eq(executionWorkspaces.companyId, companyId);
+      const [totalRow, rows] = await Promise.all([
+        db.select({ count: sql<number>`count(*)::int` }).from(executionWorkspaces).where(whereClause)
+          .then((result) => result[0] ?? { count: 0 }),
+        db.select().from(executionWorkspaces).where(whereClause)
+          .orderBy(desc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+          .limit(filters.limit).offset(filters.offset),
+      ]);
+      const items = rows.map((row) => ({
+        id: row.id,
+        companyId: row.companyId,
+        projectId: row.projectId,
+        projectWorkspaceId: row.projectWorkspaceId,
+        sourceIssueId: row.sourceIssueId,
+        mode: row.mode,
+        strategyType: row.strategyType,
+        name: row.name,
+        status: row.status,
+        cwd: row.cwd,
+        repoUrl: row.repoUrl,
+        baseRef: row.baseRef,
+        baseRefSnapshot: isRecord(row.metadata?.baseRefSnapshot) ? row.metadata.baseRefSnapshot : null,
+        branchName: row.branchName,
+        providerType: row.providerType,
+        providerRef: row.providerRef,
+        metadata: row.metadata,
+        openedAt: row.openedAt,
+        lastUsedAt: row.lastUsedAt,
+        closedAt: row.closedAt,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      }));
+      const nextOffset = filters.offset + items.length;
+      return {
+        items,
+        total: totalRow.count,
+        limit: filters.limit,
+        offset: filters.offset,
+        hasMore: nextOffset < totalRow.count,
+        nextOffset: nextOffset < totalRow.count ? nextOffset : null,
+      };
+    },
+
     listOverview: async (
       companyId: string,
       filters: WorkspaceOverviewQuery,
@@ -2251,7 +2348,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         git,
         warnings: gitWarnings,
         statusInspectionSucceeded,
-      } = await inspectGitCloseReadiness(executionWorkspace);
+      } = await inspectGitCloseReadiness(executionWorkspace, opts.afterGitDeliveryInspection);
       const { deliveryState } = await assessDelivery(workspace, git);
       const warnings = [...gitWarnings];
       const blockingReasons: string[] = [];
@@ -2528,7 +2625,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
       for (const workspace of candidates) {
         const executionWorkspace = toExecutionWorkspace(workspace);
-        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
+        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace, opts.afterGitDeliveryInspection);
         if (!statusInspectionSucceeded) {
           result.skippedUndelivered += 1;
           continue;

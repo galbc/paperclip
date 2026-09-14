@@ -550,6 +550,88 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(workspace).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
   }, 20_000);
 
+  it("does not use a parent checkout discovered from a nested git-worktree stub as delivery evidence", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const stubPath = path.join(seeded.worktreePath, "missing-worktree-stub");
+    await fs.mkdir(stubPath);
+    await db.update(executionWorkspaces).set({ cwd: stubPath, providerRef: stubPath })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("unknown");
+    expect(readiness?.git).toMatchObject({ identityVerified: false, isMergedIntoBase: null });
+    expect(readiness?.warnings).toContain(
+      `Git resolved workspace path "${stubPath}" to a different worktree root; delivery evidence is unknown.`,
+    );
+  }, 20_000);
+
+  it("does not use a live branch that differs from the recorded workspace branch", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await runGit(seeded.worktreePath, ["switch", "-c", "unexpected-live-branch"]);
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("unknown");
+    expect(readiness?.git).toMatchObject({ identityVerified: false, isMergedIntoBase: null });
+    expect(readiness?.warnings.some((warning) => warning.includes("Live git branch does not match recorded branch"))).toBe(true);
+  }, 20_000);
+
+  it("invalidates delivery evidence when HEAD changes during inspection", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const racingService = executionWorkspaceService(db, {
+      afterGitDeliveryInspection: async () => {
+        await fs.writeFile(path.join(seeded.worktreePath, "racing-head.txt"), "changed\n", "utf8");
+        await runGit(seeded.worktreePath, ["add", "racing-head.txt"]);
+        await runGit(seeded.worktreePath, ["commit", "-m", "Move HEAD during inspection"]);
+      },
+    });
+
+    const readiness = await racingService.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("unknown");
+    expect(readiness?.git).toMatchObject({ identityVerified: false, headSha: null, isMergedIntoBase: null });
+    expect(readiness?.warnings).toContain("Git HEAD changed during delivery inspection; delivery evidence is unknown.");
+  }, 20_000);
+
+  it("lists bounded company-scoped raw audit metadata without scheduling live git inspection", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await db.update(executionWorkspaces).set({
+      metadata: { baseRefSnapshot: { ref: "main", sha: "recorded-base-sha" }, auditMarker: "kept" },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const gitStatusSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+
+    const page = await svc.listAudit(seeded.companyId, { limit: 1, offset: 0 });
+
+    expect(page).toMatchObject({ total: 1, limit: 1, offset: 0, hasMore: false, nextOffset: null });
+    expect(page.items[0]).toMatchObject({
+      id: seeded.executionWorkspaceId,
+      sourceIssueId: seeded.sourceIssueId,
+      providerRef: seeded.worktreePath,
+      branchName: expect.any(String),
+      baseRef: "main",
+      baseRefSnapshot: { ref: "main", sha: "recorded-base-sha" },
+      metadata: { baseRefSnapshot: { ref: "main", sha: "recorded-base-sha" }, auditMarker: "kept" },
+    });
+    expect(gitStatusSpy).not.toHaveBeenCalled();
+    gitStatusSpy.mockRestore();
+  }, 20_000);
+
+  it("does not infer task delivery from a shared workspace HEAD matching its target", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const liveBranch = await readGit(seeded.worktreePath, ["branch", "--show-current"]);
+    await db.update(executionWorkspaces).set({ mode: "shared_workspace", baseRef: liveBranch })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("unknown");
+    expect(readiness?.git).toMatchObject({ identityVerified: true, isMergedIntoBase: null });
+    expect(readiness?.warnings).toContain(
+      "Shared workspace HEAD alone cannot establish task delivery; pull request evidence is required.",
+    );
+  }, 20_000);
+
   it("fails closed before archive when git status inspection is unavailable", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
     const statusSpy = vi.spyOn(workspaceGitOperationScheduler, "run")

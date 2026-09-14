@@ -36,6 +36,11 @@ export const workspaceOverviewQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).optional().default(0),
 }).strict();
 
+export const executionWorkspaceAuditQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional().default(100),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+}).strict();
+
 export const executionWorkspaceConfigSchema = z.object({
   environmentId: z.string().uuid().optional().nullable(),
   provisionCommand: z.string().optional().nullable(),
@@ -89,6 +94,8 @@ export const executionWorkspaceCloseGitReadinessSchema = z.object({
   workspacePath: z.string().nullable(),
   branchName: z.string().nullable(),
   baseRef: z.string().nullable(),
+  headSha: z.string().nullable(),
+  identityVerified: z.boolean(),
   hasDirtyTrackedFiles: z.boolean(),
   hasUntrackedFiles: z.boolean(),
   dirtyEntryCount: z.number().int().nonnegative(),
@@ -178,3 +185,4 @@ export const reconcileExecutionWorkspaceBranchSchema = z.discriminatedUnion("mod
 export type UpdateExecutionWorkspace = z.infer<typeof updateExecutionWorkspaceSchema>;
 export type ReconcileExecutionWorkspaceBranch = z.infer<typeof reconcileExecutionWorkspaceBranchSchema>;
 export type WorkspaceOverviewQuery = z.infer<typeof workspaceOverviewQuerySchema>;
+export type ExecutionWorkspaceAuditQuery = z.infer<typeof executionWorkspaceAuditQuerySchema>;

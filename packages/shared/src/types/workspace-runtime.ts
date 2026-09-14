@@ -132,6 +132,8 @@ export interface ExecutionWorkspaceCloseGitReadiness {
   workspacePath: string | null;
   branchName: string | null;
   baseRef: string | null;
+  headSha: string | null;
+  identityVerified: boolean;
   hasDirtyTrackedFiles: boolean;
   hasUntrackedFiles: boolean;
   dirtyEntryCount: number;
@@ -140,6 +142,40 @@ export interface ExecutionWorkspaceCloseGitReadiness {
   behindCount: number | null;
   isMergedIntoBase: boolean | null;
   createdByRuntime: boolean;
+}
+
+export interface ExecutionWorkspaceAuditItem {
+  id: string;
+  companyId: string;
+  projectId: string | null;
+  projectWorkspaceId: string | null;
+  sourceIssueId: string | null;
+  mode: string;
+  strategyType: string;
+  name: string;
+  status: string;
+  cwd: string | null;
+  repoUrl: string | null;
+  baseRef: string | null;
+  baseRefSnapshot: Record<string, unknown> | null;
+  branchName: string | null;
+  providerType: string | null;
+  providerRef: string | null;
+  metadata: Record<string, unknown> | null;
+  openedAt: Date;
+  lastUsedAt: Date;
+  closedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ExecutionWorkspaceAuditResponse {
+  items: ExecutionWorkspaceAuditItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  nextOffset: number | null;
 }
 
 export interface ExecutionWorkspaceCloseReadiness {

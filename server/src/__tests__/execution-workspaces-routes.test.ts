@@ -7,6 +7,7 @@ import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   list: vi.fn(),
   listOverview: vi.fn(),
+  listAudit: vi.fn(),
   listSummaries: vi.fn(),
   getById: vi.fn(),
   getCloseReadiness: vi.fn(),
@@ -167,6 +168,23 @@ describe.sequential("execution workspace routes", () => {
 
     expect(res.status).toBe(422);
     expect(mockExecutionWorkspaceService.listOverview).not.toHaveBeenCalled();
+  });
+
+  it("delegates bounded raw audit queries", async () => {
+    mockExecutionWorkspaceService.listAudit.mockResolvedValueOnce({
+      items: [], total: 0, limit: 100, offset: 0, hasMore: false, nextOffset: null,
+    });
+    const res = await request(createApp())
+      .get("/api/companies/company-1/execution-workspaces/audit?limit=100&offset=200");
+    expect(res.status).toBe(200);
+    expect(mockExecutionWorkspaceService.listAudit).toHaveBeenCalledWith("company-1", { limit: 100, offset: 200 });
+  });
+
+  it("rejects raw audit pages above the 200-record bound", async () => {
+    const res = await request(createApp())
+      .get("/api/companies/company-1/execution-workspaces/audit?limit=201");
+    expect(res.status).toBe(422);
+    expect(mockExecutionWorkspaceService.listAudit).not.toHaveBeenCalled();
   });
 
   it.each([

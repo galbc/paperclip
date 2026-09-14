@@ -233,6 +233,19 @@ Allow additional private hostnames (for example custom Tailscale hostnames):
 npx paperclipai allowed-hostname dotta-macbook-pro
 ```
 
+## Execution workspace audit reads
+
+Use `GET /api/companies/{companyId}/execution-workspaces/audit` to enumerate
+recorded workspace evidence without triggering Git status, pull-request, runtime
+service, or delivery-state resolution. The endpoint is company-scoped and uses
+`limit`/`offset` pagination with a default page size of 100 and a hard maximum of
+200 records. It includes the recorded source issue, branch, base ref,
+`metadata.baseRefSnapshot`, provider path, timestamps, and full metadata.
+
+`deliveryState` is deliberately absent from this raw audit response. It is a
+computed read-time assessment, not a stored delivery verdict. The endpoint does
+not synthesize a delivery commit SHA when no such evidence was recorded.
+
 ## Test Commands
 
 Use the cheap local default unless you are specifically working on browser flows:

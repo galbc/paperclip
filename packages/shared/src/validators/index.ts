@@ -554,6 +554,7 @@ export {
   reconcileExecutionWorkspaceBranchSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
+  executionWorkspaceAuditQuerySchema,
   executionWorkspaceDeliveryStateSchema,
   executionWorkspaceStatusSchema,
   executionWorkspaceCloseActionKindSchema,
@@ -565,6 +566,7 @@ export {
   type ReconcileExecutionWorkspaceBranch,
   type UpdateExecutionWorkspace,
   type WorkspaceOverviewQuery,
+  type ExecutionWorkspaceAuditQuery,
 } from "./execution-workspace.js";
 
 export {

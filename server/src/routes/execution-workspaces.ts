@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
   findWorkspaceCommandDefinition,
+  executionWorkspaceAuditQuerySchema,
   matchWorkspaceRuntimeServiceToCommand,
   reconcileExecutionWorkspaceBranchSchema,
   updateExecutionWorkspaceSchema,
@@ -116,6 +117,18 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
 
     const overview = await svc.listOverview(companyId, parsed.data);
     res.json(overview);
+  });
+
+  router.get("/companies/:companyId/execution-workspaces/audit", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertExecutionWorkspaceReadAllowed(req, res, companyId))) return;
+    const parsed = executionWorkspaceAuditQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(422).json({ error: "Invalid execution workspace audit query", details: parsed.error.flatten() });
+      return;
+    }
+    res.json(await svc.listAudit(companyId, parsed.data));
   });
 
   router.get("/execution-workspaces/:id", async (req, res) => {
