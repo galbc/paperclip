@@ -617,10 +617,54 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     gitStatusSpy.mockRestore();
   }, 20_000);
 
+  it("keeps audit offset pagination stable when workspace updatedAt changes", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const secondWorkspaceId = randomUUID();
+    const firstCreatedAt = new Date("2026-01-01T00:00:00.000Z");
+    const secondCreatedAt = new Date("2026-01-02T00:00:00.000Z");
+    await db.update(executionWorkspaces).set({ createdAt: firstCreatedAt, updatedAt: firstCreatedAt })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db.insert(executionWorkspaces).values({
+      id: secondWorkspaceId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "second-audit-workspace",
+      status: "active",
+      createdAt: secondCreatedAt,
+      updatedAt: secondCreatedAt,
+    });
+
+    const firstPage = await svc.listAudit(seeded.companyId, { limit: 1, offset: 0 });
+    await db.update(executionWorkspaces).set({ updatedAt: new Date("2026-01-03T00:00:00.000Z") })
+      .where(eq(executionWorkspaces.id, secondWorkspaceId));
+    const secondPage = await svc.listAudit(seeded.companyId, { limit: 1, offset: 1 });
+
+    expect(firstPage.items.map((item) => item.id)).toEqual([seeded.executionWorkspaceId]);
+    expect(secondPage.items.map((item) => item.id)).toEqual([secondWorkspaceId]);
+  }, 20_000);
+
   it("does not infer task delivery from a shared workspace HEAD matching its target", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
     const liveBranch = await readGit(seeded.worktreePath, ["branch", "--show-current"]);
     await db.update(executionWorkspaces).set({ mode: "shared_workspace", baseRef: liveBranch })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("unknown");
+    expect(readiness?.git).toMatchObject({ identityVerified: true, isMergedIntoBase: null });
+    expect(readiness?.warnings).toContain(
+      "Shared workspace HEAD alone cannot establish task delivery; pull request evidence is required.",
+    );
+  }, 20_000);
+
+  it("does not infer shared workspace delivery when remote-qualified base targets the live branch", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const liveBranch = await readGit(seeded.worktreePath, ["branch", "--show-current"]);
+    await runGit(seeded.worktreePath, ["update-ref", `refs/remotes/origin/${liveBranch}`, "HEAD"]);
+    await db.update(executionWorkspaces).set({ mode: "shared_workspace", baseRef: `origin/${liveBranch}` })
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);

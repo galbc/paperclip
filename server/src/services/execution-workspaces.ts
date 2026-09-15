@@ -886,9 +886,28 @@ async function inspectGitCloseReadiness(
   let behindCount: number | null = null;
   let isMergedIntoBase: boolean | null = null;
   const baseRef = workspace.baseRef;
+  let recordedBranchTargetsBase = !recordedBranchName || recordedBranchName === baseRef;
+  if (
+    workspace.mode === "shared_workspace"
+    && repoRoot
+    && baseRef
+    && recordedBranchName
+    && recordedBranchName !== baseRef
+    && identityVerified
+  ) {
+    const [recordedBranchSha, baseRefSha] = await Promise.all([
+      runGit(["rev-parse", "--verify", `refs/heads/${recordedBranchName}^{commit}`], workspacePath)
+        .then((result) => result.stdout.trim() || null)
+        .catch(() => null),
+      runGit(["rev-parse", "--verify", `${baseRef}^{commit}`], workspacePath)
+        .then((result) => result.stdout.trim() || null)
+        .catch(() => null),
+    ]);
+    recordedBranchTargetsBase = recordedBranchSha !== null && recordedBranchSha === baseRefSha;
+  }
   const allowsAncestryEvidence = !(
     workspace.mode === "shared_workspace"
-    && (!recordedBranchName || recordedBranchName === baseRef)
+    && recordedBranchTargetsBase
   );
   if (identityVerified && baseRef && !allowsAncestryEvidence) {
     warnings.push("Shared workspace HEAD alone cannot establish task delivery; pull request evidence is required.");
@@ -1851,7 +1870,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         db.select({ count: sql<number>`count(*)::int` }).from(executionWorkspaces).where(whereClause)
           .then((result) => result[0] ?? { count: 0 }),
         db.select().from(executionWorkspaces).where(whereClause)
-          .orderBy(desc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+          .orderBy(asc(executionWorkspaces.createdAt), asc(executionWorkspaces.id))
           .limit(filters.limit).offset(filters.offset),
       ]);
       const items = rows.map((row) => ({
